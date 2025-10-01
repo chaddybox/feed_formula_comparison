@@ -1,0 +1,5 @@
+streamlit
+camelot-py[cv]
+pandas
+openai
+python-dotenv
