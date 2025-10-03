@@ -333,6 +333,16 @@ if st.button("🖥️ Extract Formulas"):
                     st.session_state.df2 = df2
                     st.session_state.file1_pages = None
                     st.success("✅ Formulas extracted successfully!")
+                    
+                # Clean up temp files for single-page case
+                import os
+                try:
+                    os.unlink(path1)
+                    os.unlink(path2)
+                    st.session_state.file1_path = None
+                    st.session_state.file2_path = None
+                except:
+                    pass
 
 # Page selector for multi-page File1
 if st.session_state.file1_pages is not None and st.session_state.file1_pages > 1:
@@ -354,6 +364,17 @@ if st.session_state.file1_pages is not None and st.session_state.file1_pages > 1
                 st.session_state.df2 = df2
                 st.session_state.file1_pages = None  # Clear the page selector
                 st.success("✅ Formulas extracted successfully!")
+                
+                # Clean up temp files after extraction
+                import os
+                try:
+                    os.unlink(st.session_state.file1_path)
+                    os.unlink(st.session_state.file2_path)
+                    st.session_state.file1_path = None
+                    st.session_state.file2_path = None
+                except:
+                    pass
+                
                 st.rerun()
 
 # Display extracted formulas if they exist in session state
