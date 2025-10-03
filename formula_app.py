@@ -17,6 +17,12 @@ if "df1" not in st.session_state:
     st.session_state.df1 = None
 if "df2" not in st.session_state:
     st.session_state.df2 = None
+if "file1_pages" not in st.session_state:
+    st.session_state.file1_pages = None
+if "file1_path" not in st.session_state:
+    st.session_state.file1_path = None
+if "file2_path" not in st.session_state:
+    st.session_state.file2_path = None
 
 # -------------------------------
 # Helpers
@@ -62,12 +68,33 @@ def postprocess_pairs(df):
     return pd.DataFrame(fixed_rows)
 
 
-def extract_ingredients_from_pdf(path):
+def count_pdf_pages(path):
+    """Count the number of pages in a PDF."""
+    try:
+        tables = camelot.read_pdf(path, flavor="lattice", pages="1")
+        # Use PyPDF2 to get page count if available, otherwise estimate
+        import PyPDF2
+        with open(path, 'rb') as f:
+            pdf = PyPDF2.PdfReader(f)
+            return len(pdf.pages)
+    except:
+        # Fallback: try to read all pages and count
+        try:
+            tables = camelot.read_pdf(path, flavor="lattice", pages="all")
+            if tables.n > 0:
+                # Estimate pages from table distribution
+                return max([t.page for t in tables])
+            return 1
+        except:
+            return 1
+
+
+def extract_ingredients_from_pdf(path, pages="all"):
     """Extract Ingredient + Amount columns from PDF using Camelot, then clean + fix misalignment."""
     # Try lattice first, then fallback to stream
-    tables = camelot.read_pdf(path, flavor="lattice", pages="all")
+    tables = camelot.read_pdf(path, flavor="lattice", pages=pages)
     if tables.n == 0:
-        tables = camelot.read_pdf(path, flavor="stream", pages="all")
+        tables = camelot.read_pdf(path, flavor="stream", pages=pages)
     if tables.n == 0:
         return pd.DataFrame(columns=["Ingredient", "Amount"])
 
@@ -275,7 +302,7 @@ if st.button("🖥️ Extract Formulas"):
     if file1 is None or file2 is None:
         st.error("Please upload both PDF files before extracting.")
     else:
-        with st.spinner("📄Extracting ingredients from PDFs..."):
+        with st.spinner("📄 Extracting ingredients from PDFs..."):
             # Save files to temp paths
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as t1:
                 t1.write(file1.read())
@@ -284,15 +311,50 @@ if st.button("🖥️ Extract Formulas"):
                 t2.write(file2.read())
                 path2 = t2.name
 
-            df1 = extract_ingredients_from_pdf(path1)
-            df2 = extract_ingredients_from_pdf(path2)
+            # Store paths for later use
+            st.session_state.file1_path = path1
+            st.session_state.file2_path = path2
 
-        if df1.empty or df2.empty:
-            st.error("❌ Couldn't extract ingredients from one or both PDFs.")
-        else:
-            # Store in session state
-            st.session_state.df1 = df1
-            st.session_state.df2 = df2
+            # Check if File1 has multiple pages
+            num_pages = count_pdf_pages(path1)
+            
+            if num_pages > 1:
+                st.session_state.file1_pages = num_pages
+                st.info(f"📄 Formula 1 has {num_pages} pages. Please select which page to use below.")
+            else:
+                # Single page - extract immediately
+                df1 = extract_ingredients_from_pdf(path1)
+                df2 = extract_ingredients_from_pdf(path2)
+
+                if df1.empty or df2.empty:
+                    st.error("❌ Couldn't extract ingredients from one or both PDFs.")
+                else:
+                    st.session_state.df1 = df1
+                    st.session_state.df2 = df2
+                    st.session_state.file1_pages = None
+                    st.success("✅ Formulas extracted successfully!")
+
+# Page selector for multi-page File1
+if st.session_state.file1_pages is not None and st.session_state.file1_pages > 1:
+    selected_page = st.selectbox(
+        "Select page from Formula 1:",
+        options=list(range(1, st.session_state.file1_pages + 1)),
+        format_func=lambda x: f"Page {x}"
+    )
+    
+    if st.button("📄 Extract from Selected Page"):
+        with st.spinner(f"📄 Extracting from page {selected_page}..."):
+            df1 = extract_ingredients_from_pdf(st.session_state.file1_path, pages=str(selected_page))
+            df2 = extract_ingredients_from_pdf(st.session_state.file2_path)
+
+            if df1.empty or df2.empty:
+                st.error("❌ Couldn't extract ingredients from one or both PDFs.")
+            else:
+                st.session_state.df1 = df1
+                st.session_state.df2 = df2
+                st.session_state.file1_pages = None  # Clear the page selector
+                st.success("✅ Formulas extracted successfully!")
+                st.rerun()
 
 # Display extracted formulas if they exist in session state
 if st.session_state.df1 is not None and st.session_state.df2 is not None:
