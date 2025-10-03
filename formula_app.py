@@ -153,11 +153,28 @@ def extract_ingredients_from_pdf(path, pages="all"):
     # Fix misalignment
     result = postprocess_pairs(result)
 
-    # Exclude unwanted rows
-    exclusions = ["total", "feeding rate ingredient", "ingredient name", "ingredient detail"]
-    result = result[~result["Ingredient"].str.strip().str.lower().isin(exclusions)]
-
-    return result.reset_index(drop=True)
+    # Stop at "Total" row or nutrient analysis section
+    stop_keywords = ["total", "nutrient analysis", "moisture %", "protein %", "chloride %", 
+                     "costs", "ingredient cost", "dcad balance"]
+    
+    final_rows = []
+    for idx, row in result.iterrows():
+        ingredient = str(row["Ingredient"]).strip().lower()
+        
+        # Stop if we hit any stop keyword
+        if any(keyword in ingredient for keyword in stop_keywords):
+            break
+            
+        # Skip header-like rows
+        if ingredient in ["feeding rate ingredient", "ingredient name", "ingredient detail", ""]:
+            continue
+            
+        final_rows.append(row)
+    
+    if not final_rows:
+        return pd.DataFrame(columns=["Ingredient", "Amount"])
+    
+    return pd.DataFrame(final_rows).reset_index(drop=True)
 
 # -------------------------------
 # AI: JSON-first + robust fallback parsing
