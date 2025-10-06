@@ -129,19 +129,42 @@ def extract_ingredients_from_pdf(path, pages="all"):
                 ing_col = c
                 break
 
-    # --- Modified: Find the correct amount column ---
+    # --- Modified: Find the correct amount column with better logic ---
     amt_col = None
-    candidate_amt_cols = [c for c in raw.columns if any(k in c.lower() for k in ["amount", "lb", "ton"])]
-
-    # Prefer "lb/ton AF" explicitly
-    for c in candidate_amt_cols:
-        if "lb/ton af" in c.lower():
+    
+    # Priority 1: Look for exact "lb/ton AF" pattern (case insensitive)
+    for c in raw.columns:
+        c_clean = c.lower().strip()
+        if "lb/ton" in c_clean and "af" in c_clean:
             amt_col = c
             break
-
-    # If not found, just take the first numeric-ish column
-    if not amt_col and candidate_amt_cols:
-        amt_col = candidate_amt_cols[0]
+    
+    # Priority 2: Look for "lb/ton" without AF specification
+    if not amt_col:
+        for c in raw.columns:
+            c_clean = c.lower().strip()
+            if "lb/ton" in c_clean:
+                amt_col = c
+                break
+    
+    # Priority 3: Look for "amount" column
+    if not amt_col:
+        for c in raw.columns:
+            if "amount" in c.lower():
+                amt_col = c
+                break
+    
+    # Priority 4: Fallback to columns with "lb" or "ton" (excluding percentages and costs)
+    if not amt_col:
+        candidate_amt_cols = []
+        for c in raw.columns:
+            c_lower = c.lower()
+            # Include if has lb/ton but exclude if it's a percentage or cost column
+            if any(k in c_lower for k in ["lb", "ton"]) and not any(ex in c_lower for ex in ["%", "$/", "cost", "price"]):
+                candidate_amt_cols.append(c)
+        
+        if candidate_amt_cols:
+            amt_col = candidate_amt_cols[0]
 
     if not ing_col or not amt_col:
         return pd.DataFrame(columns=["Ingredient", "Amount"])
