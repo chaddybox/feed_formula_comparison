@@ -422,7 +422,7 @@ def fallback_parse_csv_text(csv_text):
 # -------------------------------
 # Streamlit UI
 # -------------------------------
-st.title("AI-Powered Feed Formula Comparison")
+st.title("AI-Powered Formulation Audit")
 
 file1 = st.file_uploader("Upload Formula 1 (user PDF)", type=["pdf"])
 file2 = st.file_uploader("Upload Formula 2 (software PDF)", type=["pdf"])
