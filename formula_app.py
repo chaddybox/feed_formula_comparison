@@ -91,7 +91,7 @@ def count_pdf_pages(path):
 
 def extract_ingredients_from_pdf(path, pages="all"):
     """Extract Ingredient + Amount columns from PDF using Camelot, then clean + fix misalignment."""
-    # --- Read PDF tables ---
+      # --- Read PDF tables ---
     tables = camelot.read_pdf(path, flavor="stream", pages=pages, edge_tol=50)
     if tables.n == 0:
         tables = camelot.read_pdf(path, flavor="lattice", pages=pages)
@@ -116,12 +116,12 @@ def extract_ingredients_from_pdf(path, pages="all"):
     raw = raw.drop(index=list(range(0, header_row + 1)))
     raw = raw.rename(columns=lambda x: str(x).strip())
 
-    # --- Helper to clean noisy headers (e.g., <None>2 etc.) ---
+    # --- Header normalization helper ---
     def normalize_header(s):
         if s is None:
             return ""
         s = str(s)
-        s = re.sub(r"<[^>]*>", " ", s)
+        s = re.sub(r"<[^>]*>", " ", s)     # remove <None> tokens
         s = s.replace("\xa0", " ")
         s = re.sub(r"[^A-Za-z0-9\s/]", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
@@ -139,19 +139,19 @@ def extract_ingredients_from_pdf(path, pages="all"):
                 ing_col = c
                 break
 
-    # --- Amount column detection (tiered approach) ---
+    # --- Amount column detection (robust multi-tier logic) ---
     amt_col = None
     amt_col_idx = None
     dollar = "$"
 
-    # 1️⃣ Exact or simple "amount" match (handles normal PDFs)
+    # 1️⃣ Direct "amount" match (for simpler PDFs)
     for idx, c in enumerate(raw.columns):
         if "amount" in str(c).lower() and dollar not in str(c):
             amt_col = c
             amt_col_idx = idx
             break
 
-    # 2️⃣ Look for lb/ton AF (most common in feed formulas)
+    # 2️⃣ Prefer column containing "lb/ton" and "af" (anywhere, any order)
     if not amt_col:
         for idx, c in enumerate(raw.columns):
             c_norm = normalize_header(c).lower()
@@ -160,7 +160,7 @@ def extract_ingredients_from_pdf(path, pages="all"):
                 amt_col_idx = idx
                 break
 
-    # 3️⃣ Fallback: any lb/ton (not cost)
+    # 3️⃣ Broader: header contains "lb/ton" at all
     if not amt_col:
         for idx, c in enumerate(raw.columns):
             c_norm = normalize_header(c).lower()
@@ -169,34 +169,36 @@ def extract_ingredients_from_pdf(path, pages="all"):
                 amt_col_idx = idx
                 break
 
-    # 4️⃣ Last resort: handle "AF lb" or noisy versions like "AF lb < None >2"
+    # 4️⃣ Header contains both "lb" and "af" (handles merged headers like Seagull Bay)
     if not amt_col:
         for idx, c in enumerate(raw.columns):
-            orig = str(c)
-            c_norm = normalize_header(orig)
-            if dollar in orig or "%" in orig:
-                continue
-            if re.search(r"\bAF\b", orig) and re.search(r"(?i)\blb\b", c_norm):
-                amt_col = c
-                amt_col_idx = idx
-                break
-            if re.search(r"\blb\b", c_norm, flags=re.I) and "AF" in orig:
+            c_norm = normalize_header(c).lower()
+            if "lb" in c_norm and "af" in c_norm and dollar not in c_norm:
                 amt_col = c
                 amt_col_idx = idx
                 break
 
-    # 5️⃣ Handle split header case — adjacent columns “AF” and “lb”
+    # 5️⃣ Final fallback: pick the most numeric column (ignoring cost/%)
     if not amt_col:
-        col_names = list(raw.columns)
-        for i in range(len(col_names) - 1):
-            if str(col_names[i]).strip() == "AF" and "lb" in str(col_names[i + 1]).lower():
-                amt_col = col_names[i + 1]
-                amt_col_idx = i + 1
-                break
+        best_idx = None
+        best_ratio = 0
+        for idx, c in enumerate(raw.columns):
+            cname = str(c).lower()
+            if "$" in cname or "cost" in cname or "%" in cname:
+                continue
+            col = raw[c].dropna().astype(str)
+            numeric_ratio = col.str.match(r"^\s*-?\d+(\.\d+)?\s*$").mean()
+            if numeric_ratio > best_ratio:
+                best_ratio = numeric_ratio
+                best_idx = idx
+        if best_idx is not None and best_ratio > 0.5:
+            amt_col = raw.columns[best_idx]
+            amt_col_idx = best_idx
+            st.write(f"⚠️ Used numeric fallback column: {amt_col} (ratio={best_ratio:.2f})")
 
-    # --- Bail if not found ---
+    # --- Debug info if no column found ---
     if not ing_col or not amt_col:
-        st.write("DEBUG: could not identify amount column. Headers were:")
+        st.write("DEBUG: Could not identify Ingredient or Amount column.")
         for i, c in enumerate(raw.columns):
             st.write(i, repr(c))
         return pd.DataFrame(columns=["Ingredient", "Amount"])
@@ -222,7 +224,7 @@ def extract_ingredients_from_pdf(path, pages="all"):
     # --- Fix misalignment ---
     result = postprocess_pairs(result)
 
-    # --- Stop at totals or nutrient analysis ---
+    # --- Stop at totals or nutrient sections ---
     stop_keywords = ["total", "nutrient analysis", "moisture %", "protein %",
                      "chloride %", "costs", "ingredient cost", "dcad balance"]
     final_rows = []
