@@ -91,17 +91,17 @@ def count_pdf_pages(path):
 
 def extract_ingredients_from_pdf(path, pages="all"):
     """Extract Ingredient + Amount columns from PDF using Camelot, then clean + fix misalignment."""
-    # Try lattice first, then fallback to stream
-    tables = camelot.read_pdf(path, flavor="lattice", pages=pages)
+    # --- Read PDF tables ---
+    tables = camelot.read_pdf(path, flavor="stream", pages=pages, edge_tol=50)
     if tables.n == 0:
-        tables = camelot.read_pdf(path, flavor="stream", pages=pages)
+        tables = camelot.read_pdf(path, flavor="lattice", pages=pages)
     if tables.n == 0:
         return pd.DataFrame(columns=["Ingredient", "Amount"])
 
     df_list = [t.df for t in tables]
     raw = pd.concat(df_list, ignore_index=True)
 
-    # Find header row
+    # --- Find header row ---
     header_row = None
     for i, row in raw.iterrows():
         row_lower = [str(cell).lower() for cell in row]
@@ -109,7 +109,6 @@ def extract_ingredients_from_pdf(path, pages="all"):
            any("amount" in c or "lb" in c or "ton" in c for c in row_lower):
             header_row = i
             break
-
     if header_row is None:
         return pd.DataFrame(columns=["Ingredient", "Amount"])
 
@@ -117,7 +116,18 @@ def extract_ingredients_from_pdf(path, pages="all"):
     raw = raw.drop(index=list(range(0, header_row + 1)))
     raw = raw.rename(columns=lambda x: str(x).strip())
 
-    # Find best ingredient column (prefer name over code)
+    # --- Helper to clean noisy headers (e.g., <None>2 etc.) ---
+    def normalize_header(s):
+        if s is None:
+            return ""
+        s = str(s)
+        s = re.sub(r"<[^>]*>", " ", s)
+        s = s.replace("\xa0", " ")
+        s = re.sub(r"[^A-Za-z0-9\s/]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    # --- Ingredient column detection ---
     ing_col = None
     for c in raw.columns:
         if "name" in c.lower():
@@ -129,75 +139,107 @@ def extract_ingredients_from_pdf(path, pages="all"):
                 ing_col = c
                 break
 
-    # --- Modified: Find the correct amount column with better logic ---
+    # --- Amount column detection (tiered approach) ---
     amt_col = None
-    
-    # Priority 1: Look for exact "lb/ton AF" pattern (case insensitive)
-    for c in raw.columns:
-        c_clean = c.lower().strip()
-        if "lb/ton" in c_clean and "af" in c_clean:
-            amt_col = c
-            break
-    
-    # Priority 2: Look for "lb/ton" without AF specification
-    if not amt_col:
-        for c in raw.columns:
-            c_clean = c.lower().strip()
-            if "lb/ton" in c_clean:
-                amt_col = c
-                break
-    
-    # Priority 3: Look for "amount" column
-    if not amt_col:
-        for c in raw.columns:
-            if "amount" in c.lower():
-                amt_col = c
-                break
-    
-    # Priority 4: Fallback to columns with "lb" or "ton" (excluding percentages and costs)
-    if not amt_col:
-        candidate_amt_cols = []
-        for c in raw.columns:
-            c_lower = c.lower()
-            # Include if has lb/ton but exclude if it's a percentage or cost column
-            if any(k in c_lower for k in ["lb", "ton"]) and not any(ex in c_lower for ex in ["%", "$/", "cost", "price"]):
-                candidate_amt_cols.append(c)
-        
-        if candidate_amt_cols:
-            amt_col = candidate_amt_cols[0]
+    amt_col_idx = None
+    dollar = "$"
 
+    # 1️⃣ Exact or simple "amount" match (handles normal PDFs)
+    for idx, c in enumerate(raw.columns):
+        if "amount" in str(c).lower() and dollar not in str(c):
+            amt_col = c
+            amt_col_idx = idx
+            break
+
+    # 2️⃣ Look for lb/ton AF (most common in feed formulas)
+    if not amt_col:
+        for idx, c in enumerate(raw.columns):
+            c_norm = normalize_header(c).lower()
+            if "lb/ton" in c_norm and "af" in c_norm and dollar not in c_norm:
+                amt_col = c
+                amt_col_idx = idx
+                break
+
+    # 3️⃣ Fallback: any lb/ton (not cost)
+    if not amt_col:
+        for idx, c in enumerate(raw.columns):
+            c_norm = normalize_header(c).lower()
+            if "lb/ton" in c_norm and dollar not in c_norm:
+                amt_col = c
+                amt_col_idx = idx
+                break
+
+    # 4️⃣ Last resort: handle "AF lb" or noisy versions like "AF lb < None >2"
+    if not amt_col:
+        for idx, c in enumerate(raw.columns):
+            orig = str(c)
+            c_norm = normalize_header(orig)
+            if dollar in orig or "%" in orig:
+                continue
+            if re.search(r"\bAF\b", orig) and re.search(r"(?i)\blb\b", c_norm):
+                amt_col = c
+                amt_col_idx = idx
+                break
+            if re.search(r"\blb\b", c_norm, flags=re.I) and "AF" in orig:
+                amt_col = c
+                amt_col_idx = idx
+                break
+
+    # 5️⃣ Handle split header case — adjacent columns “AF” and “lb”
+    if not amt_col:
+        col_names = list(raw.columns)
+        for i in range(len(col_names) - 1):
+            if str(col_names[i]).strip() == "AF" and "lb" in str(col_names[i + 1]).lower():
+                amt_col = col_names[i + 1]
+                amt_col_idx = i + 1
+                break
+
+    # --- Bail if not found ---
     if not ing_col or not amt_col:
+        st.write("DEBUG: could not identify amount column. Headers were:")
+        for i, c in enumerate(raw.columns):
+            st.write(i, repr(c))
         return pd.DataFrame(columns=["Ingredient", "Amount"])
 
-    # Keep just Ingredient + Amount
-    result = raw[[ing_col, amt_col]].rename(columns={ing_col: "Ingredient", amt_col: "Amount"})
+    # --- Keep Ingredient + Amount ---
+    result = raw[[ing_col, amt_col]].copy()
+    result.columns = ["Ingredient", "Amount"]
     result = result[result["Ingredient"].notna()]
 
-    # Fix misalignment
+    # --- Numeric cleaning ---
+    def extract_number(x):
+        if pd.isna(x):
+            return None
+        s = str(x).strip()
+        s = re.sub(r"[^0-9.\-]", "", s)
+        try:
+            return float(s) if s else None
+        except:
+            return None
+
+    result["Amount"] = result["Amount"].apply(extract_number)
+
+    # --- Fix misalignment ---
     result = postprocess_pairs(result)
 
-    # Stop at "Total" row or nutrient analysis section
-    stop_keywords = ["total", "nutrient analysis", "moisture %", "protein %", "chloride %", 
-                     "costs", "ingredient cost", "dcad balance"]
-    
+    # --- Stop at totals or nutrient analysis ---
+    stop_keywords = ["total", "nutrient analysis", "moisture %", "protein %",
+                     "chloride %", "costs", "ingredient cost", "dcad balance"]
     final_rows = []
-    for idx, row in result.iterrows():
+    for _, row in result.iterrows():
         ingredient = str(row["Ingredient"]).strip().lower()
-        
-        # Stop if we hit any stop keyword
-        if any(keyword in ingredient for keyword in stop_keywords):
+        if any(k in ingredient for k in stop_keywords):
             break
-            
-        # Skip header-like rows
         if ingredient in ["feeding rate ingredient", "ingredient name", "ingredient detail", ""]:
             continue
-            
         final_rows.append(row)
-    
+
     if not final_rows:
         return pd.DataFrame(columns=["Ingredient", "Amount"])
-    
+
     return pd.DataFrame(final_rows).reset_index(drop=True)
+
+
 
 # -------------------------------
 # AI: JSON-first + robust fallback parsing
@@ -219,10 +261,14 @@ Formula 2 (software-entered): {formula2_list}
 Rules:
 - Identify the best match in Formula 2 for each Formula 1 ingredient.
 - Consider synonyms, abbreviations, ingredient codes, and common feed naming conventions.
-- If ingredient names are not exactly alike, make a short note about why the ingredient match was made (see "Ingredient Notes" in OUTPUT REQUIREMENTS below).
-- Compare amounts (tolerance ±{int(tolerance*100)}%). If no amount is provided in Formula 1, use null.
-- If amounts differ outside tolerance, mark as a mismatch.
-- If amounts differ outside of tolerance, try to identify a reason in the "Amount Notes" field (e.g., "Different moisture basis", "User entered as-is", "Subbed ingredient with different concentration.").
+- Compare ingredient *amounts* numerically when both are available.
+  • The tolerance is ±{int(tolerance*100)}%.
+  • If Formula 2's amount is within this range of Formula 1, that is a **Match ✅**.
+  • If it differs by more than this tolerance, it is a **Mismatch ❌**.
+  • If an amount is missing (null), still attempt a name match but mark the amount comparison as "No Data".
+- Do not mark amounts as mismatched if the difference is within tolerance.
+- Include a short note in "Amount Notes" if the difference is outside tolerance, e.g. "Different moisture basis" or "Rounded value".
+- Return results as described below.
 
 OUTPUT REQUIREMENTS (IMPORTANT):
 Return ONLY a JSON array, nothing else. Do NOT include explanations, markdown, or code fences.
