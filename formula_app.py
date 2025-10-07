@@ -91,7 +91,7 @@ def count_pdf_pages(path):
 
 def extract_ingredients_from_pdf(path, pages="all"):
     """Extract Ingredient + Amount columns from PDF using Camelot, then clean + fix misalignment."""
-      # --- Read PDF tables ---
+    # Try stream first (better for complex tables), then fallback to lattice
     tables = camelot.read_pdf(path, flavor="stream", pages=pages, edge_tol=50)
     if tables.n == 0:
         tables = camelot.read_pdf(path, flavor="lattice", pages=pages)
@@ -101,7 +101,7 @@ def extract_ingredients_from_pdf(path, pages="all"):
     df_list = [t.df for t in tables]
     raw = pd.concat(df_list, ignore_index=True)
 
-    # --- Find header row ---
+    # Find header row
     header_row = None
     for i, row in raw.iterrows():
         row_lower = [str(cell).lower() for cell in row]
@@ -109,6 +109,7 @@ def extract_ingredients_from_pdf(path, pages="all"):
            any("amount" in c or "lb" in c or "ton" in c for c in row_lower):
             header_row = i
             break
+
     if header_row is None:
         return pd.DataFrame(columns=["Ingredient", "Amount"])
 
@@ -116,18 +117,7 @@ def extract_ingredients_from_pdf(path, pages="all"):
     raw = raw.drop(index=list(range(0, header_row + 1)))
     raw = raw.rename(columns=lambda x: str(x).strip())
 
-    # --- Header normalization helper ---
-    def normalize_header(s):
-        if s is None:
-            return ""
-        s = str(s)
-        s = re.sub(r"<[^>]*>", " ", s)     # remove <None> tokens
-        s = s.replace("\xa0", " ")
-        s = re.sub(r"[^A-Za-z0-9\s/]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    # --- Ingredient column detection ---
+    # Find best ingredient column (prefer name over code)
     ing_col = None
     for c in raw.columns:
         if "name" in c.lower():
@@ -139,106 +129,157 @@ def extract_ingredients_from_pdf(path, pages="all"):
                 ing_col = c
                 break
 
-    # --- Amount column detection (robust multi-tier logic) ---
+    # --- Enhanced: Find the correct amount column handling merged headers ---
     amt_col = None
     amt_col_idx = None
-    dollar = "$"
-
-    # 1️⃣ Direct "amount" match (for simpler PDFs)
+    dollar = '$'
+    
+    # Priority 1: Look for "lb/ton af" pattern, excluding cost columns
     for idx, c in enumerate(raw.columns):
-        if "amount" in str(c).lower() and dollar not in str(c):
-            amt_col = c
-            amt_col_idx = idx
-            break
-
-    # 2️⃣ Prefer column containing "lb/ton" and "af" (anywhere, any order)
+        c_lower = str(c).lower()
+        if 'lb/ton' in c_lower and 'af' in c_lower:
+            if not (c_lower.strip().startswith(dollar) or c_lower.strip().startswith("cost")):
+                amt_col = c
+                amt_col_idx = idx
+                break
+    
+    # Priority 2: Fallback - Look for any lb/ton column (not cost)
     if not amt_col:
         for idx, c in enumerate(raw.columns):
-            c_norm = normalize_header(c).lower()
-            if "lb/ton" in c_norm and "af" in c_norm and dollar not in c_norm:
+            c_lower = str(c).lower()
+            if 'lb/ton' in c_lower and dollar not in c_lower:
+                amt_col = c
+                amt_col_idx = idx
+                break
+    
+    # Priority 3: Look for "AF lb" or "DM lb" columns
+    if not amt_col:
+        for idx, c in enumerate(raw.columns):
+            c_lower = str(c).lower().strip()
+            if ('af' in c_lower and 'lb' in c_lower) or ('dm' in c_lower and 'lb' in c_lower):
+                if dollar not in c_lower and '%' not in c_lower:
+                    amt_col = c
+                    amt_col_idx = idx
+                    break
+    
+    # Priority 4: Last resort - Look for "amount" column
+    if not amt_col:
+        for idx, c in enumerate(raw.columns):
+            if "amount" in str(c).lower():
                 amt_col = c
                 amt_col_idx = idx
                 break
 
-    # 3️⃣ Broader: header contains "lb/ton" at all
-    if not amt_col:
-        for idx, c in enumerate(raw.columns):
-            c_norm = normalize_header(c).lower()
-            if "lb/ton" in c_norm and dollar not in c_norm:
-                amt_col = c
-                amt_col_idx = idx
-                break
-
-    # 4️⃣ Header contains both "lb" and "af" (handles merged headers like Seagull Bay)
-    if not amt_col:
-        for idx, c in enumerate(raw.columns):
-            c_norm = normalize_header(c).lower()
-            if "lb" in c_norm and "af" in c_norm and dollar not in c_norm:
-                amt_col = c
-                amt_col_idx = idx
-                break
-
-    # 5️⃣ Final fallback: pick the most numeric column (ignoring cost/%)
-    if not amt_col:
-        best_idx = None
-        best_ratio = 0
-        for idx, c in enumerate(raw.columns):
-            cname = str(c).lower()
-            if "$" in cname or "cost" in cname or "%" in cname:
-                continue
-            col = raw[c].dropna().astype(str)
-            numeric_ratio = col.str.match(r"^\s*-?\d+(\.\d+)?\s*$").mean()
-            if numeric_ratio > best_ratio:
-                best_ratio = numeric_ratio
-                best_idx = idx
-        if best_idx is not None and best_ratio > 0.5:
-            amt_col = raw.columns[best_idx]
-            amt_col_idx = best_idx
-            st.write(f"⚠️ Used numeric fallback column: {amt_col} (ratio={best_ratio:.2f})")
-
-    # --- Debug info if no column found ---
     if not ing_col or not amt_col:
-        st.write("DEBUG: Could not identify Ingredient or Amount column.")
-        for i, c in enumerate(raw.columns):
-            st.write(i, repr(c))
         return pd.DataFrame(columns=["Ingredient", "Amount"])
 
-    # --- Keep Ingredient + Amount ---
+    # Keep just Ingredient + Amount columns
     result = raw[[ing_col, amt_col]].copy()
     result.columns = ["Ingredient", "Amount"]
     result = result[result["Ingredient"].notna()]
-
-    # --- Numeric cleaning ---
-    def extract_number(x):
-        if pd.isna(x):
+    
+    # Analyze the column header to understand structure
+    amt_col_str = str(amt_col)
+    # Check if merged by newlines OR multiple column names in header
+    is_merged_column = "\n" in amt_col_str or (len(amt_col_str) > 30 and " " in amt_col_str)
+    
+    # Also check if column header contains multiple indicators (e.g., "% of AF lb/ton AF AF $/ton")
+    has_multiple_columns = False
+    col_indicators = ['%', 'lb/ton', dollar, 'af lb', 'dm lb']
+    indicator_count = sum(1 for ind in col_indicators if ind in amt_col_str.lower())
+    if indicator_count >= 2:
+        has_multiple_columns = True
+        is_merged_column = True
+    
+    # Find which position in merged column contains "lb/ton AF"
+    lbton_position = None
+    if is_merged_column:
+        if "\n" in amt_col_str:
+            parts = amt_col_str.split('\n')
+        else:
+            parts = re.split(r'\s{2,}', amt_col_str)
+        
+        for i, part in enumerate(parts):
+            part_lower = part.lower().strip()
+            if 'lb/ton' in part_lower:
+                if 'af' in part_lower and dollar not in part_lower:
+                    lbton_position = i
+                    break
+                elif dollar not in part_lower and lbton_position is None:
+                    lbton_position = i
+    
+    # Apply extraction based on column structure
+    def smart_extract(val):
+        if pd.isna(val):
             return None
-        s = str(x).strip()
-        s = re.sub(r"[^0-9.\-]", "", s)
-        try:
-            return float(s) if s else None
-        except:
+        val_str = str(val).strip()
+        if not val_str or val_str.lower() in ["nan", "none", ""]:
             return None
+        
+        # Check if value contains multiple numbers (even if column header doesn't look merged)
+        numbers_in_value = re.findall(r'\d+\.?\d+', val_str)
+        
+        if is_merged_column and lbton_position is not None:
+            floats = []
+            for n in numbers_in_value:
+                try:
+                    floats.append(float(n))
+                except:
+                    continue
+            
+            if len(floats) > lbton_position:
+                return floats[lbton_position]
+            elif floats:
+                substantial = [f for f in floats if f > 1]
+                return substantial[0] if substantial else floats[0]
+        elif len(numbers_in_value) > 1:
+            # Multiple numbers found but position not determined
+            # This handles cases where column looks clean but data is merged
+            floats = []
+            for n in numbers_in_value:
+                try:
+                    floats.append(float(n))
+                except:
+                    continue
+            
+            # Try to intelligently pick the right number
+            # If we have 3 numbers, likely pattern is: [% of AF] [lb/ton AF] [$/ton]
+            if len(floats) >= 3:
+                return floats[1]  # Middle value
+            elif len(floats) == 2:
+                # Return first substantial number (> 1)
+                substantial = [f for f in floats if f > 1]
+                return substantial[0] if substantial else floats[0]
+            elif len(floats) == 1:
+                return floats[0]
+        
+        # Single number or standard extraction
+        return extract_number(val)
+    
+    result["Amount"] = result["Amount"].apply(smart_extract)
 
-    result["Amount"] = result["Amount"].apply(extract_number)
-
-    # --- Fix misalignment ---
+    # Fix misalignment
     result = postprocess_pairs(result)
 
-    # --- Stop at totals or nutrient sections ---
-    stop_keywords = ["total", "nutrient analysis", "moisture %", "protein %",
-                     "chloride %", "costs", "ingredient cost", "dcad balance"]
+    # Stop at "Total" row or nutrient analysis section
+    stop_keywords = ["total", "nutrient analysis", "moisture %", "protein %", "chloride %", 
+                     "costs", "ingredient cost", "dcad balance"]
+    
     final_rows = []
-    for _, row in result.iterrows():
+    for idx, row in result.iterrows():
         ingredient = str(row["Ingredient"]).strip().lower()
-        if any(k in ingredient for k in stop_keywords):
+        
+        if any(keyword in ingredient for keyword in stop_keywords):
             break
+            
         if ingredient in ["feeding rate ingredient", "ingredient name", "ingredient detail", ""]:
             continue
+            
         final_rows.append(row)
-
+    
     if not final_rows:
         return pd.DataFrame(columns=["Ingredient", "Amount"])
-
+    
     return pd.DataFrame(final_rows).reset_index(drop=True)
 
 
